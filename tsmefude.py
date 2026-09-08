@@ -1,20 +1,4 @@
-"""Time-Shift Multiscale Ensemble Fuzzy Dispersion Entropy (TSMEFuDE).
-
-Translation of ``TSMEFuDE.m`` under ``legacy/matlab/base_methods/`` with
-the F.2 correction approved by the project owner on 2026-08-19: the
-nested ``TSE_beta`` of the original computes only the last phase per
-scale (the ``X{beta}=[]`` reset discards every ``m < beta`` phase) and
-caps each phase at the largest multiple of ``beta`` <= N instead of N,
-so intermediate phases (1 < beta < k, beta not dividing N) lose tail
-samples. This module implements the published time-shift multiscale
-definition instead: ``X{beta} = S(beta:k:end)`` for beta = 1..k, one
-entropy per phase, averaged over the k phases.
-
-The deviation from the legacy output is quantified in
-``tests/matlab_reference/tsmefude/entropy_ref_*.csv`` (TSEn_legacy
-column); see ``docs/open_questions.md`` (F.2 ruling) and
-``docs/discrepancy_log.md`` (D.15).
-"""
+"""Time-Shift Multiscale Ensemble Fuzzy Dispersion Entropy (TSMEFuDE)"""
 
 import numpy as np
 
