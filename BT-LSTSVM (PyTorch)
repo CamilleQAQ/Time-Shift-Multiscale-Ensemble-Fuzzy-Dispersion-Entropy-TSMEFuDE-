@@ -1,0 +1,623 @@
+"""PyTorch float64 implementations of the BT-LSTSVM equations.
+
+Two deliberately separate modes live here:
+
+``MatlabCompatTorchBTLSTSVM`` preserves the artificial zero rows and explicit
+matrix inverses in the historical MATLAB code.  It is a numerical research
+compatibility model and is never eligible for Agent deployment.
+
+``TorchBTLSTSVM`` implements the same sequential BT-LSTSVM classifier without
+the artificial rows.  Its prediction API accepts features only and routes each
+sample through the fitted binary tree without consulting test labels.
+
+Dataset adapters and diagnosis registrations do not belong in this module.
+
+Reading guide
+-------------
+* ``_TorchBinaryLSTSVM`` -- shared binary equations.
+* ``_solve_when_fewer_positives`` / ``_solve_when_balanced`` /
+  ``_solve_when_fewer_negatives`` -- the three MATLAB branches.
+* ``_SequentialTorchBTLSTSVM`` -- one-vs-remaining tree built on top.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from dataclasses import dataclass
+from typing import TypeVar
+
+import numpy as np
+import torch
+
+
+_Binary = TypeVar("_Binary", bound="_TorchBinaryLSTSVM")
+_DTYPE = torch.float64
+_DEVICE = torch.device("cpu")
+
+
+def _features(value: np.ndarray, *, width: int | None = None) -> np.ndarray:
+    """Validate a nonempty, finite, two-dimensional feature matrix."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
+        raise ValueError("features must be a nonempty two-dimensional matrix")
+    if width is not None and array.shape[1] != width:
+        raise ValueError("feature dimension does not match training data")
+    if not np.isfinite(array).all():
+        raise ValueError("nonfinite features are not accepted or imputed")
+    return array
+
+
+def _tensor(value: np.ndarray) -> torch.Tensor:
+    # Copying prevents a caller mutating NumPy storage behind a fitted model.
+    return torch.tensor(value, dtype=_DTYPE, device=_DEVICE)
+
+
+def _rbf(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    bandwidth: float,
+) -> torch.Tensor:
+    """Match the operation order in the historical MATLAB ``kernelfun.m``.
+
+    The explicit ``(cross + left_norm) + right_norm`` grouping is intentional:
+    reassociating it changes the floating-point result and breaks MATLAB parity.
+    """
+    cross = -2.0 * (left @ right.T)
+    left_norm = torch.sum(left * left, dim=1, keepdim=True).expand(-1, len(right))
+    right_norm = torch.sum(right * right, dim=1).unsqueeze(0).expand(len(left), -1)
+    squared_distance = (cross + left_norm) + right_norm
+    return torch.exp(-squared_distance / (2.0 * bandwidth))
+
+
+@dataclass(frozen=True)
+class TorchTwinScores:
+    positive_distance: np.ndarray
+    negative_distance: np.ndarray
+
+
+@dataclass(frozen=True)
+class TorchTreePrediction:
+    """Prediction plus a complete, label-free binary-tree routing audit.
+
+    Matrices have shape ``(sample_count, node_count)``. Unreached nodes keep
+    ``False`` in ``reached`` and ``NaN`` in the two distance matrices.
+    """
+
+    labels: np.ndarray
+    reached: np.ndarray
+    positive_distance: np.ndarray
+    negative_distance: np.ndarray
+    accepted_at_node: np.ndarray
+
+
+class _TorchBinaryLSTSVM:
+    """Shared float64 CPU implementation of the original binary equations.
+
+    Naming convention (matching the historical MATLAB variables):
+
+    * ``positive_design`` / MATLAB ``G`` -- RBF design matrix of the +1 rows,
+      with a trailing column of ones for the bias term.
+    * ``negative_design`` / MATLAB ``H`` -- same for the -1 rows.
+    * ``positive_hyperplane`` / MATLAB ``plane1`` -- normal vector of the
+      hyperplane associated with the positive class.
+    * ``negative_hyperplane`` / MATLAB ``plane2`` -- normal vector of the
+      hyperplane associated with the negative class.
+    """
+
+    deployment_eligible: bool
+    include_matlab_zero_rows: bool
+
+    def __init__(
+        self,
+        *,
+        c1: float = 0.25,
+        c2: float = 0.25,
+        bandwidth: float = 4.0,
+        epsilon: float = 1e-4,
+    ) -> None:
+        if not all(
+            np.isfinite(value) and value > 0
+            for value in (c1, c2, bandwidth, epsilon)
+        ):
+            raise ValueError(
+                "c1, c2, bandwidth and epsilon must be finite and positive"
+            )
+        self.c1 = float(c1)
+        self.c2 = float(c2)
+        self.bandwidth = float(bandwidth)
+        self.epsilon = float(epsilon)
+
+    # ------------------------------------------------------------------ fit
+
+    def fit(self: _Binary, x: np.ndarray, y: np.ndarray) -> _Binary:
+        """Fit the two float64 least-squares twin hyperplanes."""
+        feature_matrix = _features(x)
+        labels = np.asarray(y)
+        if labels.shape != (len(feature_matrix),) or not np.isin(
+            labels, (-1, 1)
+        ).all():
+            raise ValueError(
+                "binary labels must be a vector containing only +1 and -1"
+            )
+
+        positive = feature_matrix[labels == 1]
+        negative = feature_matrix[labels == -1]
+        if not len(positive) or not len(negative):
+            raise ValueError("both binary classes require training rows")
+
+        if self.include_matlab_zero_rows:
+            positive, negative = self._prepend_zero_rows(positive, negative)
+
+        anchors, positive_design, negative_design = self._build_design_matrices(
+            positive, negative
+        )
+        positive_hyperplane, negative_hyperplane = self._solve_hyperplanes(
+            positive_design, negative_design
+        )
+
+        self._store_fitted_state(
+            width=feature_matrix.shape[1],
+            anchors=anchors,
+            positive_hyperplane=positive_hyperplane,
+            negative_hyperplane=negative_hyperplane,
+        )
+        return self
+
+    @staticmethod
+    def _prepend_zero_rows(
+        positive: np.ndarray, negative: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Recreate the artificial zero rows used by the historical MATLAB code."""
+        zero = np.zeros((1, positive.shape[1]), dtype=np.float64)
+        return np.vstack((zero, positive)), np.vstack((zero, negative))
+
+    def _build_design_matrices(
+        self, positive: np.ndarray, negative: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the anchors and both augmented RBF design matrices."""
+        positive_t = _tensor(positive)
+        negative_t = _tensor(negative)
+        anchors = torch.cat((positive_t, negative_t), dim=0)
+
+        positive_design = torch.cat(
+            (
+                _rbf(positive_t, anchors, self.bandwidth),
+                torch.ones((len(positive_t), 1), dtype=_DTYPE, device=_DEVICE),
+            ),
+            dim=1,
+        )
+        negative_design = torch.cat(
+            (
+                _rbf(negative_t, anchors, self.bandwidth),
+                torch.ones((len(negative_t), 1), dtype=_DTYPE, device=_DEVICE),
+            ),
+            dim=1,
+        )
+        return anchors, positive_design, negative_design
+
+    def _solve_hyperplanes(
+        self,
+        positive_design: torch.Tensor,
+        negative_design: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch to the MATLAB branch selected by class row counts."""
+        positive_count = len(positive_design)
+        negative_count = len(negative_design)
+        if positive_count < negative_count:
+            return self._solve_when_fewer_positives(
+                positive_design, negative_design
+            )
+        if positive_count == negative_count:
+            return self._solve_when_balanced(
+                positive_design, negative_design
+            )
+        return self._solve_when_fewer_negatives(
+            positive_design, negative_design
+        )
+
+    def _solve_when_fewer_positives(
+        self,
+        positive_design: torch.Tensor,
+        negative_design: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MATLAB branch ``m1 < m2``: fewer positive rows than negative rows."""
+        positive_count = len(positive_design)
+        negative_count = len(negative_design)
+
+        identity_features = torch.eye(
+            negative_design.shape[1], dtype=_DTYPE, device=_DEVICE
+        )
+        identity_negative = torch.eye(
+            negative_count, dtype=_DTYPE, device=_DEVICE
+        )
+        # Projector built from the (larger) negative-class design matrix.
+        negative_projector = (
+            identity_features
+            - negative_design.T
+            @ torch.linalg.inv(
+                self.epsilon * identity_negative
+                + negative_design @ negative_design.T
+            )
+            @ negative_design
+        ) / self.epsilon
+
+        positive_projection = (
+            positive_design @ negative_projector @ positive_design.T
+        )
+        identity_positive = torch.eye(
+            positive_count, dtype=_DTYPE, device=_DEVICE
+        )
+        projector_c1 = (
+            negative_projector
+            - negative_projector
+            @ positive_design.T
+            @ torch.linalg.inv(
+                self.c1 * identity_positive + positive_projection
+            )
+            @ positive_design
+            @ negative_projector
+        )
+        projector_c2 = (
+            negative_projector
+            - negative_projector
+            @ positive_design.T
+            @ torch.linalg.inv(
+                identity_positive / self.c2 + positive_projection
+            )
+            @ positive_design
+            @ negative_projector
+        )
+
+        ones_positive = torch.ones(positive_count, dtype=_DTYPE, device=_DEVICE)
+        ones_negative = torch.ones(negative_count, dtype=_DTYPE, device=_DEVICE)
+
+        # Parentheses mirror ``(H' * e2)`` and ``(G' * e1)`` in MATLAB.
+        # Reassociating these products is numerically unsafe here.
+        positive_hyperplane = -(
+            projector_c1 @ (negative_design.T @ ones_negative)
+        )
+        negative_hyperplane = self.c2 * (
+            projector_c2 @ (positive_design.T @ ones_positive)
+        )
+        return positive_hyperplane, negative_hyperplane
+
+    def _solve_when_balanced(
+        self,
+        positive_design: torch.Tensor,
+        negative_design: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MATLAB branch ``m1 == m2``: direct regularized Gram solve."""
+        positive_gram = positive_design.T @ positive_design
+        negative_gram = negative_design.T @ negative_design
+        identity = torch.eye(
+            positive_design.shape[1], dtype=_DTYPE, device=_DEVICE
+        )
+
+        ones_positive = torch.ones(
+            len(positive_design), dtype=_DTYPE, device=_DEVICE
+        )
+        ones_negative = torch.ones(
+            len(negative_design), dtype=_DTYPE, device=_DEVICE
+        )
+
+        positive_hyperplane = (
+            -torch.linalg.inv(
+                positive_gram / self.c1
+                + negative_gram
+                + self.epsilon * identity
+            )
+            @ negative_design.T
+            @ ones_negative
+        )
+        negative_hyperplane = (
+            torch.linalg.inv(
+                negative_gram / self.c2
+                + positive_gram
+                + self.epsilon * identity
+            )
+            @ positive_design.T
+            @ ones_positive
+        )
+        return positive_hyperplane, negative_hyperplane
+
+    def _solve_when_fewer_negatives(
+        self,
+        positive_design: torch.Tensor,
+        negative_design: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MATLAB branch ``m1 > m2``: fewer negative rows than positive rows."""
+        positive_count = len(positive_design)
+        negative_count = len(negative_design)
+
+        identity_features = torch.eye(
+            positive_design.shape[1], dtype=_DTYPE, device=_DEVICE
+        )
+        identity_positive = torch.eye(
+            positive_count, dtype=_DTYPE, device=_DEVICE
+        )
+        # Projector built from the (larger) positive-class design matrix.
+        positive_projector = (
+            identity_features
+            - positive_design.T
+            @ torch.linalg.inv(
+                self.epsilon * identity_positive
+                + positive_design @ positive_design.T
+            )
+            @ positive_design
+        ) / self.epsilon
+
+        negative_projection = (
+            negative_design @ positive_projector @ negative_design.T
+        )
+        identity_negative = torch.eye(
+            negative_count, dtype=_DTYPE, device=_DEVICE
+        )
+        projector_c1 = (
+            positive_projector
+            - positive_projector
+            @ negative_design.T
+            @ torch.linalg.inv(
+                identity_negative / self.c1 + negative_projection
+            )
+            @ negative_design
+            @ positive_projector
+        )
+        projector_c2 = (
+            positive_projector
+            - positive_projector
+            @ negative_design.T
+            @ torch.linalg.inv(
+                self.c2 * identity_negative + negative_projection
+            )
+            @ negative_design
+            @ positive_projector
+        )
+
+        ones_positive = torch.ones(positive_count, dtype=_DTYPE, device=_DEVICE)
+        ones_negative = torch.ones(negative_count, dtype=_DTYPE, device=_DEVICE)
+
+        positive_hyperplane = -self.c1 * (
+            projector_c1 @ (negative_design.T @ ones_negative)
+        )
+        negative_hyperplane = projector_c2 @ (
+            positive_design.T @ ones_positive
+        )
+        return positive_hyperplane, negative_hyperplane
+
+    def _store_fitted_state(
+        self,
+        *,
+        width: int,
+        anchors: torch.Tensor,
+        positive_hyperplane: torch.Tensor,
+        negative_hyperplane: torch.Tensor,
+    ) -> None:
+        # Cloning keeps fitted tensors independent of any temporary buffers.
+        self._width = width
+        self._anchors = anchors.detach().clone()
+        self._positive_hyperplane = positive_hyperplane.detach().clone()
+        self._negative_hyperplane = negative_hyperplane.detach().clone()
+        self._is_fitted = True
+
+    # -------------------------------------------------------------- predict
+
+    def _design(self, data: np.ndarray) -> torch.Tensor:
+        rows = _tensor(data)
+        kernel = _rbf(rows, self._anchors, self.bandwidth)
+        bias = torch.ones((len(rows), 1), dtype=_DTYPE, device=_DEVICE)
+        return torch.cat((kernel, bias), dim=1)
+
+    def scores(self, x: np.ndarray) -> TorchTwinScores:
+        if not getattr(self, "_is_fitted", False):
+            raise ValueError("model has not been fitted")
+        data = _features(x, width=self._width)
+        design = self._design(data)
+        positive_distance = torch.abs(design @ self._positive_hyperplane)
+        negative_distance = torch.abs(design @ self._negative_hyperplane)
+        return TorchTwinScores(
+            positive_distance=positive_distance.numpy(force=True),
+            negative_distance=negative_distance.numpy(force=True),
+        )
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        """Assign each row to the nearer fitted hyperplane."""
+        twin = self.scores(x)
+        return np.where(
+            twin.positive_distance <= twin.negative_distance, 1, -1
+        )
+
+
+class MatlabCompatTorchBinaryLSTSVM(_TorchBinaryLSTSVM):
+    """Historical binary MATLAB behavior, including artificial zero rows.
+
+    The live MATLAB gold run reports six computational threads.  Since these
+    ill-conditioned explicit inverses are sensitive to BLAS reduction order,
+    compatibility operations temporarily use that same thread count.  This
+    quarantined offline mode is not intended for concurrent serving.
+    """
+
+    deployment_eligible = False
+    include_matlab_zero_rows = True
+
+    def __init__(self, *args, torch_threads: int = 6, **kwargs) -> None:
+        if not isinstance(torch_threads, int) or torch_threads < 1:
+            raise ValueError("torch_threads must be a positive integer")
+        super().__init__(*args, **kwargs)
+        self.torch_threads = torch_threads
+
+    @contextlib.contextmanager
+    def _matlab_thread_count(self):
+        """Temporarily pin the BLAS thread count to the MATLAB gold-run value."""
+        previous_thread_count = torch.get_num_threads()
+        try:
+            torch.set_num_threads(self.torch_threads)
+            yield
+        finally:
+            torch.set_num_threads(previous_thread_count)
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> MatlabCompatTorchBinaryLSTSVM:
+        with self._matlab_thread_count():
+            return super().fit(x, y)
+
+    def scores(self, x: np.ndarray) -> TorchTwinScores:
+        with self._matlab_thread_count():
+            return super().scores(x)
+
+
+class TorchBinaryLSTSVM(_TorchBinaryLSTSVM):
+    """Deployment-capable LSTSVM node without artificial training rows."""
+
+    # Eligibility belongs to a validated, versioned ModelArtifact rather than
+    # to a classifier algorithm or an arbitrary fitted instance.
+    deployment_eligible = False
+    artifact_registration_capable = True
+    include_matlab_zero_rows = False
+
+
+class _SequentialTorchBTLSTSVM:
+    binary_model_type: type[_TorchBinaryLSTSVM]
+    deployment_eligible: bool
+
+    def __init__(
+        self,
+        *,
+        c1: float = 0.25,
+        c2: float = 0.25,
+        bandwidth: float = 4.0,
+        epsilon: float = 1e-4,
+    ) -> None:
+        self.parameters = {
+            "c1": c1,
+            "c2": c2,
+            "bandwidth": bandwidth,
+            "epsilon": epsilon,
+        }
+        # Validate the node configuration before a partially configured tree
+        # can reach fit or artifact serialization.
+        self.binary_model_type(**self.parameters)
+
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        class_order: tuple[int, ...] | None = None,
+    ) -> _SequentialTorchBTLSTSVM:
+        """Fit one-vs-remaining nodes in an explicit class order."""
+        feature_matrix = _features(x)
+        labels = np.asarray(y)
+        if labels.shape != (len(feature_matrix),) or not np.issubdtype(
+            labels.dtype, np.integer
+        ):
+            raise ValueError(
+                "multiclass labels must be a one-dimensional integer vector"
+            )
+
+        classes = tuple(int(item) for item in np.unique(labels))
+        order = (
+            classes
+            if class_order is None
+            else tuple(int(item) for item in class_order)
+        )
+        if (
+            len(classes) < 2
+            or len(order) != len(classes)
+            or set(order) != set(classes)
+        ):
+            raise ValueError(
+                "class_order must contain every training class exactly once"
+            )
+
+        self._width = feature_matrix.shape[1]
+        self.classes_ = order
+        self.models_: list[_TorchBinaryLSTSVM] = []
+
+        # Each node accepts one class against all remaining classes. The final
+        # class is the residual fallback, so only order[:-1] needs a model.
+        for position, positive_class in enumerate(order[:-1]):
+            active_rows = np.isin(labels, order[position:])
+            binary_labels = np.where(
+                labels[active_rows] == positive_class, 1, -1
+            )
+            binary_model = self.binary_model_type(**self.parameters).fit(
+                feature_matrix[active_rows], binary_labels
+            )
+            self.models_.append(binary_model)
+        return self
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        """Return labels without retaining the per-node routing trace."""
+        return self.predict_with_trace(x).labels
+
+    def predict_with_trace(self, x: np.ndarray) -> TorchTreePrediction:
+        """Route samples through the fitted tree and retain every node decision."""
+        if not hasattr(self, "models_"):
+            raise ValueError("model has not been fitted")
+
+        feature_matrix = _features(x, width=self._width)
+        predicted_labels = np.full(
+            len(feature_matrix), self.classes_[-1], dtype=np.int64
+        )
+
+        trace_shape = (len(feature_matrix), len(self.models_))
+        reached = np.zeros(trace_shape, dtype=bool)
+        accepted_at_node = np.zeros(trace_shape, dtype=bool)
+        positive_distance = np.full(trace_shape, np.nan, dtype=np.float64)
+        negative_distance = np.full(trace_shape, np.nan, dtype=np.float64)
+
+        # Samples still waiting for a node to accept them; the rest keep the
+        # residual fallback label from ``classes_[-1]``.
+        unresolved_indices = np.arange(len(feature_matrix))
+
+        for node_index, (label, model) in enumerate(
+            zip(self.classes_[:-1], self.models_)
+        ):
+            if not len(unresolved_indices):
+                break
+
+            scores = model.scores(feature_matrix[unresolved_indices])
+            accepted_here = (
+                scores.positive_distance <= scores.negative_distance
+            )
+
+            reached[unresolved_indices, node_index] = True
+            accepted_at_node[unresolved_indices, node_index] = accepted_here
+            positive_distance[unresolved_indices, node_index] = (
+                scores.positive_distance
+            )
+            negative_distance[unresolved_indices, node_index] = (
+                scores.negative_distance
+            )
+
+            predicted_labels[unresolved_indices[accepted_here]] = label
+            unresolved_indices = unresolved_indices[~accepted_here]
+
+        return TorchTreePrediction(
+            labels=predicted_labels,
+            reached=reached,
+            positive_distance=positive_distance,
+            negative_distance=negative_distance,
+            accepted_at_node=accepted_at_node,
+        )
+
+
+class MatlabCompatTorchBTLSTSVM(_SequentialTorchBTLSTSVM):
+    """Quarantined MATLAB-compatible BT model; never register for diagnosis."""
+
+    binary_model_type = MatlabCompatTorchBinaryLSTSVM
+    deployment_eligible = False
+
+
+class TorchBTLSTSVM(_SequentialTorchBTLSTSVM):
+    """Label-free-at-prediction BT-LSTSVM backed by torch.float64 on CPU."""
+
+    binary_model_type = TorchBinaryLSTSVM
+    deployment_eligible = False
+    artifact_registration_capable = True
+
+
+# Compatibility aliases for the historical W-spelling used by earlier releases.
+_TorchBinaryLSTWSVM = _TorchBinaryLSTSVM
+MatlabCompatTorchBinaryLSTWSVM = MatlabCompatTorchBinaryLSTSVM
+TorchBinaryLSTWSVM = TorchBinaryLSTSVM
+TorchBTLSTWSVM = TorchBTLSTSVM
